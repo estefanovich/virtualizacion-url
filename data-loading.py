@@ -3,12 +3,18 @@ import http.client
 import json
 import random
 import sys
+import threading
+import queue
 
-DOMAIN = "dtlh97kqh2.execute-api.us-east-1.amazonaws.com"
-PATH = "/prod"
+csv.field_size_limit(sys.maxsize)
 
-def make_request(domain, path, method, request_payload):
-    connection = http.client.HTTPSConnection(domain)
+DOMAIN = "z7jvpnl323.execute-api.us-west-2.amazonaws.com"
+PATH = "/produ"
+
+requests_queue = queue.Queue(maxsize=32*1024)
+
+def make_request(host, path, method, request_payload):
+    connection = http.client.HTTPSConnection(host)
 ##    print(str(json.dumps(request_payload)))
 ##    print(path)
     connection.request(method, path, json.dumps(request_payload), {"Content-type": "application/json"})
@@ -17,17 +23,46 @@ def make_request(domain, path, method, request_payload):
     if (response.status == 200):
         data = response.read().decode("utf-8")
         response_payload = json.loads(data)
+        print(str(response_payload))
         if "id" in response_payload.keys():
-            object_id = response_payload["id"]
+            return {"status": response.status, "id": response_payload["id"]}
         else:
-            object_id = None
-        return {"status": response.status, "id": object_id}
+            return {"status": 500}
     else:
         return {"status": response.status}
+
+def process_request(queue):
+    while True:
+        request = queue.get()
+        result = make_request(request["host"], request["path"], request["method"], request["data"])
+        if request["expected_status"] == 200:
+            if result["status"] == 200:
+                request["target"]["api-id"] = result["id"]
+            else:
+                print("Error while calling endopoint \"" + request["path"] + "\". Retrying.")
+                result = make_request(request["host"], request["path"], request["method"], request["data"])
+                if result["status"] == 200:
+                    request["target"]["api-id"] = result["id"]
+                else:
+                    print("Error while calling endopoint \"" + request["path"] + "\". Exiting.")
+                    sys.exit()
+        else:
+            if result["status"] != request["expected_status"]:
+                print("Error while calling endopoint \"" + request["path"] + "\". Retrying.")
+                result = make_request(request["host"], request["path"], request["method"], request["data"])
+                if result["status"] != request["expected_status"]:
+                    print("Error while calling endopoint \"" + request["path"] + "\". Exiting.")
+        queue.task_done()
+
+for i in range(2):
+    thread = threading.Thread(target=process_request, args=(requests_queue,))
+    thread.daemon = True
+    thread.start()
 
 advertisers = {}
 publishers = {}
 
+##********************************************************************************************************************************##
 with open("advertisers.csv") as advertisers_file:
     reader = csv.reader(advertisers_file)
     for row in reader:
@@ -124,125 +159,175 @@ for advertiser_id in advertisers.keys():
 
 ##print(json.dumps(advertisers, indent=4))
 
+##********************************************************************************************************************************##
 for advertiser in advertisers.values():
     print("Creating advertiser \"" + advertiser["name"] + "\".")
     data = {}
     data["name"] = advertiser["name"]
-    result = make_request(DOMAIN, PATH + "/advertisers", "POST", data)
-    if result["status"] == 200:
-        print("Advertiser ID: " + str(result["id"]) + ".\n")
-        advertiser["api-id"] = result["id"]
-    else:
-        print("Error creating advertiser: Invalid response.")
-        sys.exit()
 
+    request = {}
+    request["host"] = DOMAIN
+    request["path"] = PATH + "/advertisers"
+    request["method"] = "POST"
+    request["data"] = data
+    request["expected_status"] = 200
+    request["target"] = advertiser
+    requests_queue.put(request)
+requests_queue.join()
+
+for advertiser in advertisers.values():
     for campaign in advertiser["campaigns"].values():
-        print("Creating campaign \"" + campaign["name"] + "\".")
+        print("Creating advertiser campaign \"" + campaign["name"] + "\".")
         data = {}
         data["name"] = campaign["name"]
         data["category"] = campaign["category"]
-        result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns", "POST", data)
-        if result["status"] == 200:
-            print("Campaign ID: " + str(result["id"]) + ".\n")
-            campaign["api-id"] = result["id"]
-        else:
-            print("Error creating campaign: Invalid response.")
-            sys.exit()
-        
+
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns"
+        request["method"] = "POST"
+        request["data"] = data
+        request["expected_status"] = 200
+        request["target"] = campaign
+        requests_queue.put(request)
+requests_queue.join()
+
+for advertiser in advertisers.values():
+    for campaign in advertiser["campaigns"].values():
         if campaign["status"] == True:
-            print("Activating campaign.\n")
+            print("Activating campaign \"" + campaign["name"] + "\".")
             data = {}
             data["status"] = campaign["status"]
-            result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]), "PUT", data)
-            if result["status"] != 204:
-                print("Error activating campaign: Invalid response.")
-                sys.exit()
 
-        print("Setting campaign bid to $" + str(campaign["bid"]) + ".\n")
+            request = {}
+            request["host"] = DOMAIN
+            request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"])
+            request["method"] = "PUT"
+            request["data"] = data
+            request["expected_status"] = 204
+            requests_queue.put(request)
+            
+        print("Setting $" + str(campaign["bid"]) + " bid to campaign " + campaign["name"] + "\".")
         data = {}
         data["bid"] = campaign["bid"]
-        result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/bid", "PUT", data)
-        if result["status"] != 204:
-            print("Error setting campaign bid: Invalid response.")
-            sys.exit()
 
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/bid"
+        request["method"] = "PUT"
+        request["data"] = data
+        request["expected_status"] = 204
+        requests_queue.put(request)
+        
         if "targeting_zip_codes" in campaign.keys():
-            print("Setting campaign targeting. " + str(len(campaign["targeting_zip_codes"])) + " zip codes in targeting.\n")
+            print("Setting " + str(len(campaign["targeting_zip_codes"])) + " zip codes in targeting for campaign " + campaign["name"] + "\".")
             data = {}
             data["zip-codes"] = campaign["targeting_zip_codes"]
-            result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/targeting", "PUT", data)
-            if result["status"] != 204:
-                print("Error setting campaign targeting: Invalid response.")
-                sys.exit()
 
+            request = {}
+            request["host"] = DOMAIN
+            request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/targeting"
+            request["method"] = "PUT"
+            request["data"] = data
+            request["expected_status"] = 204
+            requests_queue.put(request)
 
         if campaign["budget"] > 0:
+            print("Setting budget of $" + str(campaign["budget"]) + " to campaign " + campaign["name"] + "\".")
             data = {}
             data["budget"] = campaign["budget"]
-            print("Setting campaign budget to $" + str(campaign["budget"]) + ".\n")
-            result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/budget", "PUT", data)
-            if result["status"] != 204:
-                print("Error setting campaign bid: Invalid response.")
-                sys.exit()
 
+            request = {}
+            request["host"] = DOMAIN
+            request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/budget"
+            request["method"] = "PUT"
+            request["data"] = data
+            request["expected_status"] = 204
+            requests_queue.put(request)
+requests_queue.join()
+
+for advertiser in advertisers.values():
     for ad in advertiser["ads"].values():
+        print("Creating ad with headline \"" + ad["headline"] + "\".")
         data = {}
         data["headline"] = ad["headline"]
         data["description"] = ad["description"]
         data["url"] = ad["url"]
-        print("Creating ad with headline \"" + ad["headline"] + "\".")
-        result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/ads", "POST", data)
-        if result["status"] == 200:
-            print("Ad ID: " + str(result["id"]) + ".\n")
-            ad["api-id"] = result["id"]
-        else:
-            print("Error creating campaign: Invalid response.")
-            sys.exit()
 
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/ads"
+        request["method"] = "POST"
+        request["data"] = data
+        request["expected_status"] = 200
+        request["target"] = ad
+        requests_queue.put(request)
+requests_queue.join()
+
+for advertiser in advertisers.values():
     for campaign in advertiser["campaigns"].values():
+        print("Assigning ads to campaign \"" + campaign["name"] + "\".\n")
         ads = []
         for ad in campaign["ads"]:
             ads.append(advertiser["ads"][ad]["api-id"])
         data = {}
         data["ads"] = ads
-        result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/ads", "PUT", data)
-        print("Assigning ads to campaign \"" + campaign["name"] + "\".\n")
-        if result["status"] != 204:
-            print("Error assigning ads to campaign: Invalid response.")
-            sys.exit()
 
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/ads"
+        request["method"] = "PUT"
+        request["data"] = data
+        request["expected_status"] = 204
+        requests_queue.put(request)
+requests_queue.join()
+
+##********************************************************************************************************************************##
 for publisher in publishers.values():
     print("Creating publisher \"" + publisher["name"] + "\".")
     data = {}
     data["name"] = publisher["name"]
-    result = make_request(DOMAIN, PATH + "/publishers", "POST", data)
-    if result["status"] == 200:
-        print("Publisher ID: " + str(result["id"]) + ".\n")
-        publisher["api-id"] = result["id"]
-    else:
-        print("Error creating publisher: Invalid response.")
-        sys.exit()
 
+    request = {}
+    request["host"] = DOMAIN
+    request["path"] = PATH + "/publishers"
+    request["method"] = "POST"
+    request["data"] = data
+    request["expected_status"] = 200
+    request["target"] = publisher
+    requests_queue.put(request)
+requests_queue.join()
+
+for publisher in publishers.values():
     for campaign in publisher["campaigns"].values():
+        print("Creating publisher campaign \"" + campaign["name"] + "\".")
         data = {}
         data["name"] = campaign["name"]
-        result = make_request(DOMAIN, PATH + "/publishers/" + str(publisher["api-id"]) + "/campaigns", "POST", data)
-        if result["status"] == 200:
-            print("Campaign ID: " + str(result["id"]) + ".\n")
-            campaign["api-id"] = result["id"]
-        else:
-            print("Error creating campaign: Invalid response.")
-            sys.exit()
 
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/publishers/" + str(publisher["api-id"]) + "/campaigns"
+        request["method"] = "POST"
+        request["data"] = data
+        request["expected_status"] = 200
+        request["target"] = campaign
+        requests_queue.put(request)
+requests_queue.join()
+
+for publisher in publishers.values():
+    for campaign in publisher["campaigns"].values():
         print("Setting campaign commission to " + str(campaign["commission"]) + "%.\n")
         data = {}
-##        data["commission"] = campaign["commission"]
-        data["comission"] = campaign["commission"]
-##        result = make_request(DOMAIN, PATH + "/publishers/" + str(publisher["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/commission", "PUT", data)
-        result = make_request(DOMAIN, PATH + "/publishers/" + str(publisher["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/comission", "PUT", data)
-        if result["status"] != 204:
-            print("Error setting campaign commission: Invalid response.")
-            sys.exit()
+        data["commission"] = campaign["commission"]
+        
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/publishers/" + str(publisher["api-id"]) + "/campaigns/" + str(campaign["api-id"]) + "/commission"
+        request["method"] = "PUT"
+        request["data"] = data
+        request["expected_status"] = 204
+        requests_queue.put(request)
+requests_queue.join()
 
 for advertiser in advertisers.values():
     exclusions = []
@@ -252,9 +337,12 @@ for advertiser in advertisers.values():
         print("Setting advertiser \"" + advertiser["name"] + "\" exclusions. " + str(len(exclusions)) + " publishers excluded.\n")
         data = {}
         data["publishers"] = exclusions
-        result = make_request(DOMAIN, PATH + "/advertisers/" + str(advertiser["api-id"]) + "/exclusions", "PUT", data)
-        if result["status"] != 204:
-            print("Error setting advertiser exclusions: Invalid response.")
-            sys.exit()
-
-
+        
+        request = {}
+        request["host"] = DOMAIN
+        request["path"] = PATH + "/advertisers/" + str(advertiser["api-id"]) + "/exclusions"
+        request["method"] = "PUT"
+        request["data"] = data
+        request["expected_status"] = 204
+        requests_queue.put(request)
+requests_queue.join()
